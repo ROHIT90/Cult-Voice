@@ -42,72 +42,106 @@ async function elevenTTS(text) {
   return Buffer.from(r.data); // mp3
 }
 
-/** ---------------- MP3 -> PCM (s16le 8k mono) ---------------- */
+/** ---------------- MP3 -> PCM (s16le 8k mono) for Exotel playback ---------------- */
 async function mp3ToPcm8kS16le(mp3Buf) {
   return new Promise((resolve, reject) => {
     const ff = spawn(ffmpegPath, [
-      "-hide_banner", "-loglevel", "error",
-      "-i", "pipe:0",
-      "-ac", "1",
-      "-ar", "8000",
-      "-f", "s16le",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      "pipe:0",
+      "-ac",
+      "1",
+      "-ar",
+      "8000",
+      "-f",
+      "s16le", // raw signed 16-bit LE PCM
       "pipe:1",
     ]);
+
     const chunks = [];
     ff.stdout.on("data", (d) => chunks.push(d));
-    ff.on("close", (code) => (code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error("ffmpeg failed"))));
+    ff.on("close", (code) => (code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error("ffmpeg convert failed"))));
     ff.on("error", reject);
+
     ff.stdin.write(mp3Buf);
     ff.stdin.end();
   });
 }
 
-/** ---------------- Send PCM in 20ms frames ---------------- */
+/** ---------------- Send PCM in small frames (20ms) ----------------
+ * 20ms @ 8kHz mono s16le => 160 samples => 320 bytes
+ */
 async function sendPcmStream(ws, pcmBuf, chunkBytes = 320, delayMs = 20) {
   for (let i = 0; i < pcmBuf.length; i += chunkBytes) {
     const chunk = pcmBuf.subarray(i, i + chunkBytes);
-    ws.send(JSON.stringify({ event: "media", media: { payload: chunk.toString("base64") } }));
+    ws.send(
+      JSON.stringify({
+        event: "media",
+        media: { payload: chunk.toString("base64") },
+      })
+    );
     await new Promise((r) => setTimeout(r, delayMs));
   }
 }
 
-/** ---------------- PCM -> WAV (for Whisper) ---------------- */
-function pcmS16leToWav(pcmBuf, sampleRate = 8000, channels = 1) {
-  const bitsPerSample = 16;
-  const byteRate = (sampleRate * channels * bitsPerSample) / 8;
-  const blockAlign = (channels * bitsPerSample) / 8;
+/** ---------------- Inbound RAW -> WAV for Whisper using ffmpeg ----------------
+ * Exotel inbound audio may be:
+ *  - s16le (raw linear PCM)
+ *  - mulaw (PCMU)
+ *  - alaw  (PCMA)
+ *
+ * Set env var IN_CODEC to: s16le | mulaw | alaw
+ * We'll convert 8kHz mono raw -> WAV 16kHz mono (better for Whisper).
+ */
+async function rawToWavForWhisper(rawBuf, inCodec = "s16le") {
+  return new Promise((resolve, reject) => {
+    const fmt = inCodec === "mulaw" ? "mulaw" : inCodec === "alaw" ? "alaw" : "s16le";
 
-  const header = Buffer.alloc(44);
-  header.write("RIFF", 0);
-  header.writeUInt32LE(36 + pcmBuf.length, 4);
-  header.write("WAVE", 8);
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);        // PCM fmt chunk size
-  header.writeUInt16LE(1, 20);         // audio format = PCM
-  header.writeUInt16LE(channels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(bitsPerSample, 34);
-  header.write("data", 36);
-  header.writeUInt32LE(pcmBuf.length, 40);
+    const ff = spawn(ffmpegPath, [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-f",
+      fmt,
+      "-ar",
+      "8000",
+      "-ac",
+      "1",
+      "-i",
+      "pipe:0",
+      "-ar",
+      "16000",
+      "-ac",
+      "1",
+      "-f",
+      "wav",
+      "pipe:1",
+    ]);
 
-  return Buffer.concat([header, pcmBuf]);
+    const chunks = [];
+    ff.stdout.on("data", (d) => chunks.push(d));
+    ff.on("close", (code) => (code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error("ffmpeg raw->wav failed"))));
+    ff.on("error", reject);
+
+    ff.stdin.write(rawBuf);
+    ff.stdin.end();
+  });
 }
 
 /** ---------------- STT via OpenAI Whisper ---------------- */
-async function transcribePcm(pcmBuf) {
-  // pcmBuf is s16le, 8kHz, mono
-  const wav = pcmS16leToWav(pcmBuf, 8000, 1);
+async function transcribeRawInbound(rawBuf) {
+  if (!process.env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+
+  const inCodec = process.env.IN_CODEC || "s16le";
+  const wav = await rawToWavForWhisper(rawBuf, inCodec);
 
   const file = await toFile(wav, "audio.wav", { type: "audio/wav" });
 
   const resp = await openai.audio.transcriptions.create({
     model: "whisper-1",
     file,
-    // If you want to bias language, uncomment one:
-    // language: "en",
-    // language: "hi",
   });
 
   return (resp.text || "").trim();
@@ -116,13 +150,21 @@ async function transcribePcm(pcmBuf) {
 /** ---------------- Greeting cache ---------------- */
 const GREETING_TEXT = "Hello! Welcome to Cult Sector 62. Hindi ya English?";
 let cachedGreetingPcm = null;
+let greetingReady = false;
 
 async function warmupGreeting() {
-  const mp3 = await elevenTTS(GREETING_TEXT);
-  cachedGreetingPcm = await mp3ToPcm8kS16le(mp3);
-  console.log("Greeting cached ✅");
+  try {
+    console.log("Warming up greeting via ElevenLabs...");
+    const mp3 = await elevenTTS(GREETING_TEXT);
+    cachedGreetingPcm = await mp3ToPcm8kS16le(mp3);
+    greetingReady = true;
+    console.log("Greeting ready ✅");
+  } catch (e) {
+    console.error("Greeting warmup failed:", e.message);
+    greetingReady = false;
+  }
 }
-warmupGreeting().catch((e) => console.error("Greeting warmup failed:", e.message));
+warmupGreeting();
 
 /** ---------------- WebSocket: Exotel Voicebot ---------------- */
 const wss = new WebSocketServer({ server, path: "/voicebot" });
@@ -133,8 +175,13 @@ wss.on("connection", (ws) => {
   // per-call state
   let inboundChunks = [];
   let silenceTimer = null;
-  let isSpeaking = false;      // avoid transcribing our own greeting if Exotel echoes audio
+  let isSpeaking = false; // reduce chance of transcribing our own greeting if audio echo happens
   let transcriptionInFlight = false;
+
+  // debug counters
+  let mediaFrames = 0;
+  let mediaBytes = 0;
+  let debugEvents = 0;
 
   function resetSilenceTimer() {
     if (silenceTimer) clearTimeout(silenceTimer);
@@ -146,11 +193,12 @@ wss.on("connection", (ws) => {
       if (transcriptionInFlight) return;
 
       transcriptionInFlight = true;
-      const pcm = Buffer.concat(inboundChunks);
+
+      const rawInbound = Buffer.concat(inboundChunks);
       inboundChunks = [];
 
       try {
-        const text = await transcribePcm(pcm);
+        const text = await transcribeRawInbound(rawInbound);
         if (text) console.log("USER SAID:", text);
         else console.log("USER SAID: (no speech detected)");
       } catch (e) {
@@ -162,34 +210,68 @@ wss.on("connection", (ws) => {
   }
 
   ws.on("message", async (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    // 1) Try JSON first (start/stop/media usually come as JSON)
+    let msg = null;
+    try {
+      const asText = raw.toString();
+      msg = JSON.parse(asText);
+    } catch {
+      // 2) If not JSON, treat as BINARY AUDIO
+      const audioBuf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+      inboundChunks.push(audioBuf);
+
+      mediaFrames++;
+      mediaBytes += audioBuf.length;
+      if (mediaFrames % 25 === 0) {
+        console.log(`(binary) media frames=${mediaFrames} bytes=${mediaBytes}`);
+      }
+
+      resetSilenceTimer();
+      return;
+    }
+
+    // Debug: log first few events so we can confirm structure
+    if (debugEvents < 10) {
+      console.log("IN EVENT:", msg.event, "keys:", Object.keys(msg));
+      debugEvents++;
+    }
 
     if (msg.event === "start") {
       console.log("start event received");
+
       try {
         isSpeaking = true;
-        if (!cachedGreetingPcm) await warmupGreeting();
+        if (!greetingReady || !cachedGreetingPcm) await warmupGreeting();
         await sendPcmStream(ws, cachedGreetingPcm);
         console.log("Greeting sent ✅");
       } catch (e) {
         console.error("Greeting send failed:", e.message);
         ws.close();
       } finally {
-        // small delay to avoid capturing tail end / echo of greeting
-        setTimeout(() => { isSpeaking = false; }, 500);
+        // short delay to avoid capturing tail end of greeting
+        setTimeout(() => {
+          isSpeaking = false;
+        }, 500);
       }
       return;
     }
 
-    // Incoming caller audio
+    // JSON media event
     if (msg.event === "media") {
       const b64 = msg.media?.payload;
-      if (!b64) return;
+      if (!b64) {
+        console.log("media event but no payload");
+        return;
+      }
 
-      // Exotel sends base64 PCM (s16le 8k mono) to us (as per your working setup)
       const audio = Buffer.from(b64, "base64");
       inboundChunks.push(audio);
+
+      mediaFrames++;
+      mediaBytes += audio.length;
+      if (mediaFrames % 25 === 0) {
+        console.log(`(json) media frames=${mediaFrames} bytes=${mediaBytes}`);
+      }
 
       resetSilenceTimer();
       return;
